@@ -26,6 +26,7 @@ import json
 import os
 import subprocess
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
@@ -351,27 +352,32 @@ def merge_gate(items, main_sha, top_k):
     repo = Path(__file__).resolve().parent.parent
     verdicts = {}
     for it in cands:
-        n, wt = it["number"], "/tmp/tb-wt-%d" % it["number"]
-        try:
-            subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin",
-                            "+refs/pull/%d/head" % n], check=True, timeout=120)
-            subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", wt,
-                            "FETCH_HEAD"], check=True, capture_output=True, timeout=60)
-            r = subprocess.run(["git", "-C", wt, "merge", "--no-edit", "--no-ff", main_sha],
+        n = it["number"]
+        # Own a unique parent before any Git operation. Cleanup must never
+        # remove a pre-existing worktree, even when fetch/add fails.
+        with tempfile.TemporaryDirectory(prefix="tb-wt-%d-" % n) as tmp:
+            wt = str(Path(tmp) / "worktree")
+            try:
+                subprocess.run(["git", "-C", str(repo), "fetch", "-q", "origin",
+                                "+refs/pull/%d/head" % n], check=True,
                                capture_output=True, text=True, timeout=120)
-            out = r.stdout + r.stderr
-            if r.returncode == 0:
-                verdicts[n] = "MERGE-CLEAN"
-            elif "CONFLICT" in out or "Automatic merging failed" in out:
-                verdicts[n] = "MERGE-CONFLICT"
-            else:
-                verdicts[n] = "MERGE-ERROR: " + out.strip().splitlines()[-1][:120]
-        except subprocess.CalledProcessError as e:
-            verdicts[n] = "SETUP-FAIL: " + (e.stderr or "")[-160:]
-        finally:
-            subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", wt],
-                           capture_output=True, timeout=60)
-    subprocess.run(["git", "-C", str(repo), "worktree", "prune"], capture_output=True)
+                subprocess.run(["git", "-C", str(repo), "worktree", "add", "--detach", wt,
+                                "FETCH_HEAD"], check=True, capture_output=True,
+                               text=True, timeout=60)
+                r = subprocess.run(["git", "-C", wt, "merge", "--no-edit", "--no-ff", main_sha],
+                                   capture_output=True, text=True, timeout=120)
+                out = r.stdout + r.stderr
+                if r.returncode == 0:
+                    verdicts[n] = "MERGE-CLEAN"
+                elif "CONFLICT" in out or "Automatic merging failed" in out:
+                    verdicts[n] = "MERGE-CONFLICT"
+                else:
+                    verdicts[n] = "MERGE-ERROR: " + out.strip().splitlines()[-1][:120]
+            except subprocess.CalledProcessError as e:
+                verdicts[n] = "SETUP-FAIL: " + (e.stderr or "")[-160:]
+            finally:
+                subprocess.run(["git", "-C", str(repo), "worktree", "remove", "--force", wt],
+                               capture_output=True, timeout=60)
     for it in items:
         if it["number"] in verdicts:
             it["merge_gate"] = verdicts[it["number"]]
